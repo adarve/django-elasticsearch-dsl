@@ -71,6 +71,16 @@ class DocType(DSLDocument):
         """
         return self.django.model._default_manager.all()
 
+    def get_indexing_queryset(self):
+        """
+        Build queryset (iterator) for use by indexing.
+        """
+        qs = self.get_queryset()
+        kwargs = {}
+        if DJANGO_VERSION >= (2,) and self.django.queryset_pagination:
+            kwargs = {'chunk_size': self.django.queryset_pagination}
+        return qs.iterator(**kwargs)
+
     def prepare(self, instance):
         """
         Take a model instance, and turn it into a dict that can be serialized

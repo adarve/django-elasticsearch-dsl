@@ -89,6 +89,7 @@ class Command(BaseCommand):
             self.stdout.write("Indexing {} '{}' objects".format(
                 qs.count(), doc.django.model.__name__)
             )
+            qs = doc().get_indexing_queryset()
             doc().update(qs)
 
     def _delete(self, models, options):
