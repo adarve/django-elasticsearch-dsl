@@ -6,7 +6,11 @@ cause things to index.
 
 from __future__ import absolute_import
 
+from celery.exceptions import ImproperlyConfigured
 from django.db import models
+from django.conf import settings
+from django.core.cache import cache
+from django.apps import apps
 
 from .registries import registry
 
@@ -72,13 +76,10 @@ class BaseSignalProcessor(object):
         registry.delete(instance, raise_on_error=False)
 
 
-class RealTimeSignalProcessor(BaseSignalProcessor):
-    """Real-time signal processor.
-
-    Allows for observing when saves/deletes fire and automatically updates the
-    search engine appropriately.
+class DjangoSignalsMixin(object):
     """
-
+    Enable Django signals integration
+    """
     def setup(self):
         # Listen to all model saves.
         models.signals.post_save.connect(self.handle_save)
@@ -94,3 +95,62 @@ class RealTimeSignalProcessor(BaseSignalProcessor):
         models.signals.post_delete.disconnect(self.handle_delete)
         models.signals.m2m_changed.disconnect(self.handle_m2m_changed)
         models.signals.pre_delete.disconnect(self.handle_pre_delete)
+
+
+class RealTimeSignalProcessor(DjangoSignalsMixin, BaseSignalProcessor):
+    """Real-time signal processor.
+
+    Allows for observing when saves/deletes fire and automatically updates the
+    search engine appropriately.
+    """
+    pass
+
+_DELAY = getattr(settings, 'CELERY_INDEXING_COUNTDOWN', 3)
+
+try:
+    from celery import shared_task
+except ImportError:
+    raise ImproperlyConfigured("Config celery if you want to use CelerySignalProcessor")
+else:
+    class CelerySignalProcessor(DjangoSignalsMixin, BaseSignalProcessor):
+        """Celery signal processor.
+        Allows automatic updates on the index as delayed background tasks using
+        Celery.
+        NB: We cannot process deletes as background tasks.
+        By the time the Celery worker would pick up the delete job, the
+        model instance would already deleted. We can get around this by
+        setting Celery to use `pickle` and sending the object to the worker,
+        but using `pickle` opens the application up to security concerns.
+        """
+
+        def handle_save(self, sender, instance, **kwargs):
+            """Handle save with a Celery task.
+            Given an individual model instance, update the object in the index.
+            Update the related objects either.
+            """
+            pk = instance.pk
+            app_label = instance._meta.app_label
+            model_name = instance._meta.concrete_model.__name__
+            key = f'{ES_{app_label}_{model_name}_{pk}'
+            if cache.get(key):
+                return
+            if instance._meta.concrete_model in registry:
+                self.registry_update_task.apply_async((pk, app_label, model_name),
+                    countdown=_DELAY)
+                cache.set(key, True, _DELAY)
+
+        @shared_task()
+        def registry_update_task(pk, app_label, model_name):
+            """Handle the update on the registry as a Celery task."""
+            try:
+                model = apps.get_model(app_label, model_name)
+            except LookupError:
+                pass
+            else:
+                obj = model.objects.get(pk=pk)
+                registry.update(obj)
+                registry.update_related(obj)
+                key = f'{ES_{app_label}_{model_name}_{pk}'
+                cache.delete(key)
+
+
